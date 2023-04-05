@@ -1,165 +1,148 @@
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
-import 'package:firebase_core/firebase_core.dart';
-import 'firebase_options.dart';
-import '';
+import 'dart:io' as io;
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  cameras = await availableCameras();
-  runApp(MyApp());
-}
+import 'package:camera/camera.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:path/path.dart';
+import 'package:path_provider/path_provider.dart';
+
+import 'view/camera_view.dart';
+import 'view/object_detector_painter.dart';
 
 List<CameraDescription> cameras = [];
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  cameras = await availableCameras();
+
+  runApp(MyApp());
+}
 
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      theme: ThemeData.dark(),
-      home: HomePage(),
+      debugShowCheckedModeBanner: false,
+      home: ObjectDetectorView(),
     );
   }
 }
 
-class HomePage extends StatefulWidget {
+class ObjectDetectorView extends StatefulWidget {
   @override
-  _HomePageState createState() => _HomePageState();
+  State<ObjectDetectorView> createState() => _ObjectDetectorView();
 }
 
-class _HomePageState extends State<HomePage> {
-  CameraController? cameraController;
-  CameraImage? cameraImage;
-  List? recognitionsList;
+class _ObjectDetectorView extends State<ObjectDetectorView> {
+  late ObjectDetector _objectDetector;
+  bool _canProcess = false;
+  bool _isBusy = false;
+  CustomPaint? _customPaint;
+  String? _text;
 
-  initCamera() {
-    cameraController = CameraController(cameras[0], ResolutionPreset.medium);
-    cameraController?.initialize().then((value) {
-      setState(() {
-        cameraController?.startImageStream((image) => {
-          cameraImage = image,
-          runModel(),
-        });
-      });
-    });
-  }
+  @override
+  void initState() {
+    super.initState();
 
-  runModel() async {
-    recognitionsList = await Tflite.detectObjectOnFrame(
-      bytesList: cameraImage!.planes.map((plane) {
-        return plane.bytes;
-      }).toList(),
-      imageHeight: cameraImage!.height,
-      imageWidth: cameraImage!.width,
-      imageMean: 127.5,
-      imageStd: 127.5,
-      numResultsPerClass: 1,
-      threshold: 0.4,
-    );
-
-    setState(() {
-      cameraImage;
-    });
-  }
-
-  Future loadModel() async {
-    Tflite.close();
-    await Tflite.loadModel(
-        model: "assets/ssd_mobilenet.tflite",
-        labels: "assets/ssd_mobilenet.txt");
+    _initializeDetector(DetectionMode.stream);
   }
 
   @override
   void dispose() {
+    _canProcess = false;
+    _objectDetector.close();
     super.dispose();
-
-    cameraController!.stopImageStream();
-    Tflite.close();
-  }
-
-  @override
-  Future<void> initState() async {
-    super.initState();
-
-    await Firebase.initializeApp(
-      options: DefaultFirebaseOptions.currentPlatform,
-  );
-
-    loadModel();
-    initCamera();
-  }
-
-  List<Widget> displayBoxesAroundRecognizedObjects(Size screen) {
-    if (recognitionsList == null) return [];
-
-    double factorX = screen.width;
-    double factorY = screen.height;
-
-    Color colorPick = Colors.pink;
-
-    return recognitionsList!.map((result) {
-      return Positioned(
-        left: result["rect"]["x"] * factorX,
-        top: result["rect"]["y"] * factorY,
-        width: result["rect"]["w"] * factorX,
-        height: result["rect"]["h"] * factorY,
-        child: Container(
-          decoration: BoxDecoration(
-            borderRadius: BorderRadius.all(Radius.circular(10.0)),
-            border: Border.all(color: Colors.pink, width: 2.0),
-          ),
-          child: Text(
-            "${result['detectedClass']} ${(result['confidenceInClass'] * 100).toStringAsFixed(0)}%",
-            style: TextStyle(
-              background: Paint()..color = colorPick,
-              color: Colors.black,
-              fontSize: 18.0,
-            ),
-          ),
-        ),
-      );
-    }).toList();
   }
 
   @override
   Widget build(BuildContext context) {
-    Size size = MediaQuery.of(context).size;
-    List<Widget> list = [];
-
-    list.add(
-      Positioned(
-        top: 0.0,
-        left: 0.0,
-        width: size.width,
-        height: size.height - 100,
-        child: Container(
-          height: size.height - 100,
-          child: (!cameraController!.value.isInitialized)
-              ? new Container()
-              : AspectRatio(
-            aspectRatio: cameraController!.value.aspectRatio,
-            child: CameraPreview(cameraController!),
-          ),
-        ),
-      ),
+    return CameraView(
+      title: 'Object Detector',
+      customPaint: _customPaint,
+      text: _text,
+      onImage: (inputImage) {
+        processImage(inputImage);
+      },
+      onScreenModeChanged: _onScreenModeChanged,
+      initialDirection: CameraLensDirection.back,
     );
+  }
 
-    if (cameraImage != null) {
-      list.addAll(displayBoxesAroundRecognizedObjects(size));
+  void _onScreenModeChanged(ScreenMode mode) {
+    switch (mode) {
+      case ScreenMode.gallery:
+        _initializeDetector(DetectionMode.single);
+        return;
+
+      case ScreenMode.liveFeed:
+        _initializeDetector(DetectionMode.stream);
+        return;
     }
+  }
 
-    return SafeArea(
-      child: Scaffold(
-        backgroundColor: Colors.black,
-        body: Container(
-          margin: EdgeInsets.only(top: 50),
-          color: Colors.black,
-          child: Stack(
-            children: list,
-          ),
-        ),
-      ),
+  void _initializeDetector(DetectionMode mode) async {
+    print('Set detector in mode: $mode');
+
+    final path = 'assets/ssd_mobilenet.tflite';
+    final modelPath = await _getModel(path);
+    final options = LocalObjectDetectorOptions(
+      mode: mode,
+      modelPath: modelPath,
+      classifyObjects: true,
+      multipleObjects: true,
     );
+    _objectDetector = ObjectDetector(options: options);
+    _canProcess = true;
+  }
+
+  Future<void> processImage(InputImage inputImage) async {
+    if (!_canProcess) return;
+    if (_isBusy) return;
+    _isBusy = true;
+    setState(() {
+      _text = '';
+    });
+    final objects = await _objectDetector.processImage(inputImage);
+    if (inputImage.inputImageData?.size != null &&
+        inputImage.inputImageData?.imageRotation != null) {
+      final painter = ObjectDetectorPainter(
+          objects,
+          inputImage.inputImageData!.imageRotation,
+          inputImage.inputImageData!.size);
+      _customPaint = CustomPaint(painter: painter);
+    } else {
+      String text = 'Objects found: ${objects.length}\n\n';
+      for (final object in objects) {
+        text +=
+        'Object:  trackingId: ${object.trackingId} - ${object.labels.map((e) => e.text)}\n\n';
+      }
+      _text = text;
+      // TODO: set _customPaint to draw boundingRect on top of image
+      _customPaint = null;
+    }
+    _isBusy = false;
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  Future<String> _getModel(String assetPath) async {
+    if (io.Platform.isAndroid) {
+      return 'flutter_assets/$assetPath';
+    }
+    final path = '${(await getApplicationSupportDirectory()).path}/$assetPath';
+    await io.Directory(dirname(path)).create(recursive: true);
+    final file = io.File(path);
+    if (!await file.exists()) {
+      final byteData = await rootBundle.load(assetPath);
+      await file.writeAsBytes(byteData.buffer
+          .asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+    }
+    return file.path;
   }
 }
